@@ -80,6 +80,7 @@ DEFAULT_CONFIG = {
     "ad_url": None,
     "ad_button_text": "📢 Reklama",
     "pinned_message_id": None,
+    "users": [],  # /start bosgan barcha foydalanuvchi id'lari (broadcast uchun)
 }
 
 
@@ -153,6 +154,7 @@ class AdminStates(StatesGroup):
     wait_mandatory_channel = State()
     wait_ad_text = State()
     wait_ad_url = State()
+    wait_broadcast = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -170,6 +172,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💬 Start xabari (foydalanuvchilar)", callback_data="menu:startmsg")],
         [InlineKeyboardButton(text="🔒 Majburiy kanal", callback_data="menu:mandatory")],
         [InlineKeyboardButton(text="📢 Reklama", callback_data="menu:ad")],
+        [InlineKeyboardButton(text="📣 Xabar yuborish (hammaga)", callback_data="menu:broadcast")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -226,6 +229,11 @@ def yesno_kb(prefix: str) -> InlineKeyboardMarkup:
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
+    cfg = await storage.get()
+    if message.from_user.id not in cfg.setdefault("users", []):
+        cfg["users"].append(message.from_user.id)
+        await storage.save(bot)
+
     if is_admin(message.from_user.id):
         await message.answer(
             "Assalomu alaykum, <b>BOSS</b>! 👑\nNima qilmoqchisiz?",
@@ -233,7 +241,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
-    cfg = await storage.get()
     if cfg.get("mandatory_channel"):
         if not await is_subscribed(bot, message.from_user.id, cfg["mandatory_channel"]):
             await send_subscribe_prompt(message, cfg)
@@ -666,6 +673,78 @@ async def cb_ad_clear(call: CallbackQuery, bot: Bot):
     await storage.save(bot)
     await call.answer("O'chirildi ✅", show_alert=True)
     await call.message.edit_text("BOSS, nima qilmoqchisiz?", reply_markup=main_menu_kb())
+
+
+# ---- 7) Broadcast — barcha /start bosgan foydalanuvchilarga to'g'ridan-to'g'ri xabar ----
+@router.callback_query(F.data == "menu:broadcast")
+async def cb_menu_broadcast(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    await state.set_state(AdminStates.wait_broadcast)
+    await call.message.edit_text(
+        "📣 Hammaga yubormoqchi bo'lgan xabaringizni yuboring.\n"
+        "Matn, rasm, video, fayl, audio, gif yoki stiker — hammasi mumkin.\n\n"
+        "/cancel — bekor qilish",
+        reply_markup=back_kb("main"),
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.wait_broadcast, F.chat.type == ChatType.PRIVATE)
+async def on_broadcast_content(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+
+    await state.update_data(bc_chat_id=message.chat.id, bc_message_id=message.message_id)
+    cfg = await storage.get()
+    count = len(cfg.get("users", []))
+    rows = [[
+        InlineKeyboardButton(text="✅ Ha, yubor", callback_data="bc:send"),
+        InlineKeyboardButton(text="❌ Yo'q", callback_data="bc:cancel"),
+    ]]
+    await message.answer(
+        f"Yuqoridagi xabar {count} ta foydalanuvchiga yuborilsinmi?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data == "bc:cancel")
+async def cb_broadcast_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Bekor qilindi.")
+    await call.answer()
+
+
+@router.callback_query(F.data == "bc:send")
+async def cb_broadcast_send(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    data = await state.get_data()
+    src_chat_id = data.get("bc_chat_id")
+    src_message_id = data.get("bc_message_id")
+    await state.clear()
+    if not src_chat_id or not src_message_id:
+        return await call.message.edit_text("Xatolik: yuboriladigan xabar topilmadi, qaytadan urinib ko'ring.")
+
+    cfg = await storage.get()
+    user_ids = list(cfg.get("users", []))
+    await call.message.edit_text(f"Yuborilmoqda... (0/{len(user_ids)})")
+    await call.answer()
+
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=src_chat_id, message_id=src_message_id)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"Broadcast xatolik ({uid}): {e}")
+        await asyncio.sleep(0.05)  # Telegram flood-limitidan saqlanish uchun
+
+    await call.message.edit_text(f"✅ Yuborildi: {sent} ta\n❌ Yetkazilmadi: {failed} ta")
 
 
 # ----------------------------------------------------------------------------
