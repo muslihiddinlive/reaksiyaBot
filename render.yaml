@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: reaction-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPERADMIN_ID
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: STORAGE_CHAT_ID
+        sync: false
+      - key: WEBHOOK_HOST
+        sync: false
