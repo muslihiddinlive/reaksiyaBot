@@ -41,6 +41,9 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 STORAGE_CHAT_ID = int(os.environ["STORAGE_CHAT_ID"])  # bot admin bo'lgan maxfiy guruh
 
 WEBHOOK_HOST = os.environ["WEBHOOK_HOST"].rstrip("/")  # masalan https://sizning-app.onrender.com
+if not WEBHOOK_HOST.startswith("https://") and not WEBHOOK_HOST.startswith("http://"):
+    # Render ba'zan domenni sxemasiz beradi — shu yerda avtomatik tuzatamiz
+    WEBHOOK_HOST = f"https://{WEBHOOK_HOST}"
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT = int(os.environ.get("PORT", 8080))
@@ -749,16 +752,35 @@ async def on_my_chat_member(update: ChatMemberUpdated, bot: Bot):
 # ----------------------------------------------------------------------------
 async def on_startup(bot: Bot):
     await storage.load(bot)
-    await bot.set_webhook(
-        WEBHOOK_URL,
-        allowed_updates=dp.resolve_used_update_types(),
-        drop_pending_updates=True,
-    )
-    logger.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
+
+    # set_webhook muvaffaqiyatsiz bo'lsa ham dastur qulamasligi kerak —
+    # aks holda Render uni qayta-qayta restart qiladi va webhook doim bo'sh qoladi.
+    for attempt in range(1, 6):
+        try:
+            ok = await bot.set_webhook(
+                WEBHOOK_URL,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=True,
+            )
+            info = await bot.get_webhook_info()
+            logger.info(
+                f"Webhook o'rnatildi (attempt {attempt}): ok={ok}, "
+                f"url={info.url!r}, last_error={info.last_error_message!r}"
+            )
+            if info.url:
+                break
+        except Exception as e:
+            logger.error(f"Webhook o'rnatishda xatolik (attempt {attempt}/5): {e}")
+            await asyncio.sleep(3)
+    else:
+        logger.error("Webhookni 5 urinishdan keyin ham o'rnatib bo'lmadi! Server baribir ishga tushadi.")
 
 
 async def on_shutdown(bot: Bot):
-    await bot.delete_webhook()
+    # Webhookni o'chirmaymiz: Render deploy/restart paytida qisqa vaqtga
+    # webhook bo'sh qolib ketishining oldini olish uchun.
+    # (Faqat pollingga o'tishda kerak bo'lsa qo'lda o'chiring.)
+    logger.info("Bot to'xtatilmoqda (webhook saqlab qolindi).")
 
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
