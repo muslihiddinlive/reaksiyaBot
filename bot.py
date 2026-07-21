@@ -287,6 +287,7 @@ class AdminStates(StatesGroup):
     wait_ad_text = State()
     wait_ad_url = State()
     wait_broadcast = State()
+    wait_direct_message = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -459,14 +460,32 @@ async def send_subscribe_prompt(message: Message, cfg: dict):
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
+def user_contact_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", callback_data="contact_admin")]]
+    )
+
+
 async def send_user_start(message: Message, cfg: dict):
-    await message.answer(cfg.get("start_message_user") or DEFAULT_CONFIG["start_message_user"])
+    await message.answer(
+        cfg.get("start_message_user") or DEFAULT_CONFIG["start_message_user"],
+        reply_markup=user_contact_kb(),
+    )
     if cfg.get("ad_text"):
         rows = []
         if cfg.get("ad_url"):
             rows.append([InlineKeyboardButton(text=cfg.get("ad_button_text", "📢 Reklama"), url=cfg["ad_url"])])
         kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
         await message.answer(cfg["ad_text"], reply_markup=kb)
+
+
+@router.callback_query(F.data == "contact_admin")
+async def cb_contact_admin(call: CallbackQuery):
+    await call.message.answer(
+        "✍️ Xabaringizni shu yerga yozing (matn, rasm, video — hammasi mumkin), "
+        "men uni adminga yetkazaman."
+    )
+    await call.answer()
 
 
 @router.callback_query(F.data == "check_sub")
@@ -1027,31 +1046,120 @@ async def cb_ad_clear(call: CallbackQuery, bot: Bot):
     await call.message.edit_text("BOSS, nima qilmoqchisiz?", reply_markup=main_menu_kb())
 
 
-# ---- 7) Foydalanuvchilar ro'yxati -------------------------------------------
+# ---- 7) Foydalanuvchilar ro'yxati (tugmalar + to'g'ridan-to'g'ri xabar) ----
+USERS_PAGE_SIZE = 8
+
+
+def users_page_kb(users: list[int], page: int, names: dict[int, str]) -> InlineKeyboardMarkup:
+    start = page * USERS_PAGE_SIZE
+    chunk = users[start:start + USERS_PAGE_SIZE]
+    rows = []
+    for uid in chunk:
+        rows.append([InlineKeyboardButton(text=f"🧑 {names.get(uid, str(uid))}", callback_data=f"userpick:{uid}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"userspage:{page - 1}"))
+    if start + USERS_PAGE_SIZE < len(users):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"userspage:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="📄 .txt yuklab olish", callback_data="users_export")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_users_page(call: CallbackQuery, bot: Bot, page: int):
+    cfg = await storage.get()
+    users = cfg.get("users", [])
+    if not users:
+        await call.message.edit_text(
+            "👥 Hozircha /start bosgan foydalanuvchi yo'q.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back:main")]]),
+        )
+        return
+    start = page * USERS_PAGE_SIZE
+    chunk = users[start:start + USERS_PAGE_SIZE]
+    names: dict[int, str] = {}
+    for uid in chunk:
+        try:
+            chat = await bot.get_chat(uid)
+            name = getattr(chat, "full_name", None) or getattr(chat, "first_name", None) or str(uid)
+            if getattr(chat, "username", None):
+                name += f" (@{chat.username})"
+            names[uid] = name
+        except Exception:
+            names[uid] = f"{uid} (nom olinmadi)"
+    total_pages = (len(users) - 1) // USERS_PAGE_SIZE + 1
+    await call.message.edit_text(
+        f"👥 Jami: <b>{len(users)}</b> ta foydalanuvchi (sahifa {page + 1}/{total_pages})\n"
+        "Xabar yubormoqchi bo'lgan foydalanuvchini tanlang:",
+        reply_markup=users_page_kb(users, page, names),
+    )
+
+
 @router.callback_query(F.data == "menu:users")
 async def cb_menu_users(call: CallbackQuery, bot: Bot):
     if not is_admin(call.from_user.id):
         return await call.answer()
+    await show_users_page(call, bot, 0)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("userspage:"))
+async def cb_users_page(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    page = int(call.data.split(":")[1])
+    await show_users_page(call, bot, page)
+    await call.answer()
+
+
+@router.callback_query(F.data == "users_export")
+async def cb_users_export(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
     cfg = await storage.get()
     users = cfg.get("users", [])
-    rows = [[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back:main")]]
-
-    if not users:
-        await call.message.edit_text(
-            "👥 Hozircha /start bosgan foydalanuvchi yo'q.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        )
-        await call.answer()
-        return
-
     await call.answer()
-    await call.message.edit_text(
-        f"👥 Jami: <b>{len(users)}</b> ta foydalanuvchi.\nRo'yxat fayl sifatida yuborildi ⬇️",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
     text_content = "\n".join(str(u) for u in users)
     file = BufferedInputFile(text_content.encode("utf-8"), filename="foydalanuvchilar.txt")
     await call.message.answer_document(file, caption=f"👥 Jami {len(users)} ta foydalanuvchi (Telegram ID).")
+
+
+@router.callback_query(F.data.startswith("userpick:"))
+async def cb_user_pick(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    uid = int(call.data.split(":")[1])
+    await state.set_state(AdminStates.wait_direct_message)
+    await state.update_data(direct_target=uid)
+    await call.message.edit_text(
+        f"✍️ <code>{uid}</code> ga yubormoqchi bo'lgan xabaringizni yozing "
+        "(matn, rasm, video, fayl — hammasi mumkin):\n\n/cancel — bekor qilish",
+        reply_markup=back_kb("main"),
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.wait_direct_message, F.chat.type == ChatType.PRIVATE)
+async def on_direct_message(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("Bekor qilindi.", reply_markup=main_menu_kb())
+    data = await state.get_data()
+    uid = data.get("direct_target")
+    await state.clear()
+    if not uid:
+        return await message.answer("Xatolik: foydalanuvchi topilmadi.", reply_markup=main_menu_kb())
+    try:
+        await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+        await message.answer("✅ Yuborildi.", reply_markup=main_menu_kb())
+    except TelegramForbiddenError:
+        await message.answer("❌ Foydalanuvchi botni bloklagan yoki hisobini o'chirgan, yuborib bo'lmadi.", reply_markup=main_menu_kb())
+    except Exception as e:
+        await message.answer(f"❌ Yuborib bo'lmadi: {e}", reply_markup=main_menu_kb())
 
 
 # ---- 8) Broadcast — barcha /start bosgan foydalanuvchilarga to'g'ridan-to'g'ri xabar ----
