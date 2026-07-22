@@ -39,6 +39,7 @@ cheklangan, fayl esa ~20MB gacha bo'lishi mumkin (yuz minglab user uchun yetarli
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -234,6 +235,7 @@ class ConfigStorage:
 
 
 storage = ConfigStorage(STORAGE_CHAT_ID)
+BOT_USERNAME: str | None = None  # on_startup'da to'ldiriladi (bot.me())
 router = Router()
 
 
@@ -276,6 +278,11 @@ class AdminStates(StatesGroup):
     wait_ad_text = State()
     wait_ad_url = State()
     wait_broadcast = State()
+    wait_admin_reply = State()  # admin foydalanuvchiga javob yozayotganda
+
+
+class UserStates(StatesGroup):
+    wait_contact_message = State()  # oddiy foydalanuvchi adminga xabar yozayotganda
 
 
 def is_admin(user_id: int) -> bool:
@@ -295,6 +302,16 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📣 Xabar yuborish (hammaga)", callback_data="menu:broadcast")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def user_start_kb() -> InlineKeyboardMarkup:
+    """Oddiy va premium foydalanuvchilarga /start'dan keyin ko'rsatiladigan tugmalar
+    (adminlarga bu klaviatura ko'rsatilmaydi, ular main_menu_kb() ni ko'radi)."""
+    row = [InlineKeyboardButton(text="✍️ Adminga yozish", callback_data="contact_admin")]
+    if BOT_USERNAME:
+        row.append(InlineKeyboardButton(text="➕ Kanalga qo'shish", url=f"https://t.me/{BOT_USERNAME}?startchannel=true"))
+        row.append(InlineKeyboardButton(text="➕ Guruhga qo'shish", url=f"https://t.me/{BOT_USERNAME}?startgroup=true"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 def back_kb(target: str = "main") -> InlineKeyboardMarkup:
@@ -394,7 +411,10 @@ async def send_subscribe_prompt(message: Message, cfg: dict):
 
 
 async def send_user_start(message: Message, cfg: dict):
-    await message.answer(cfg.get("start_message_user") or DEFAULT_CONFIG["start_message_user"])
+    await message.answer(
+        cfg.get("start_message_user") or DEFAULT_CONFIG["start_message_user"],
+        reply_markup=user_start_kb(),
+    )
     if cfg.get("ad_text"):
         try:
             rows = []
@@ -419,6 +439,88 @@ async def cb_check_sub(call: CallbackQuery, bot: Bot):
     await call.message.delete()
     await send_user_start(call.message, cfg)
     await call.answer()
+
+# ----------------------------------------------------------------------------
+# "ADMINGA YOZISH" — oddiy foydalanuvchi <-> admin xabar almashinuvi
+# ----------------------------------------------------------------------------
+CANCEL_CONTACT_KB = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="contact_cancel")]]
+)
+
+
+@router.callback_query(F.data == "contact_admin")
+async def cb_contact_admin(call: CallbackQuery, state: FSMContext):
+    if is_admin(call.from_user.id):
+        return await call.answer()
+    await state.set_state(UserStates.wait_contact_message)
+    await call.message.answer(
+        "✍️ Xabaringizni yozing (matn, rasm, video — hammasi bo'lishi mumkin), "
+        "adminga yuboriladi:",
+        reply_markup=CANCEL_CONTACT_KB,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "contact_cancel")
+async def cb_contact_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Bekor qilindi.")
+    await call.answer()
+
+
+@router.message(UserStates.wait_contact_message, F.chat.type == ChatType.PRIVATE)
+async def on_contact_admin_message(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    user = message.from_user
+    name = html.escape(user.full_name)
+    username_part = f" (@{html.escape(user.username)})" if user.username else ""
+    info_line = f"📩 Yangi xabar: <b>{name}</b>{username_part} — ID: <code>{user.id}</code>"
+    reply_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="↩️ Javob berish", callback_data=f"reply_to:{user.id}")]]
+    )
+    delivered = False
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.forward_message(chat_id=admin_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            await bot.send_message(admin_id, info_line, reply_markup=reply_kb)
+            delivered = True
+        except Exception as e:
+            logger.warning(f"Adminga ({admin_id}) xabar yuborib bo'lmadi: {e}")
+
+    if delivered:
+        await message.answer("✅ Xabaringiz adminga yuborildi. Tez orada javob olasiz.")
+    else:
+        await message.answer("❌ Xabaringizni yuborib bo'lmadi. Birozdan so'ng qaytadan urinib ko'ring.")
+
+
+@router.callback_query(F.data.startswith("reply_to:"))
+async def cb_reply_to(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    target_id = int(call.data.split(":", 1)[1])
+    await state.set_state(AdminStates.wait_admin_reply)
+    await state.update_data(reply_target=target_id)
+    await call.message.answer(
+        f"✍️ Foydalanuvchi (ID: <code>{target_id}</code>) uchun javobingizni yozing:"
+    )
+    await call.answer()
+
+
+@router.message(AdminStates.wait_admin_reply, F.chat.type == ChatType.PRIVATE)
+async def on_admin_reply_message(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    target_id = data.get("reply_target")
+    await state.clear()
+    if not target_id:
+        return await message.answer("❌ Xatolik: qaysi foydalanuvchiga javob berish noaniq qoldi.")
+    try:
+        await bot.copy_message(chat_id=target_id, from_chat_id=message.chat.id, message_id=message.message_id)
+        await message.answer("✅ Javobingiz yuborildi.")
+    except Exception as e:
+        await message.answer(f"❌ Yuborib bo'lmadi: <code>{e}</code>\nFoydalanuvchi botni bloklagan bo'lishi mumkin.")
+
 
 # ----------------------------------------------------------------------------
 # ASOSIY MENYU NAVIGATSIYASI (faqat admin, faqat shaxsiy chat)
@@ -1064,6 +1166,11 @@ async def on_my_chat_member(update: ChatMemberUpdated, bot: Bot):
 # WEBHOOK / RENDER ISHGA TUSHIRISH
 # ----------------------------------------------------------------------------
 async def on_startup(bot: Bot):
+    global BOT_USERNAME
+    me = await bot.me()
+    BOT_USERNAME = me.username
+    logger.info(f"Bot username aniqlandi: @{BOT_USERNAME}")
+
     await storage.load(bot)
 
     # set_webhook muvaffaqiyatsiz bo'lsa ham dastur qulamasligi kerak —
